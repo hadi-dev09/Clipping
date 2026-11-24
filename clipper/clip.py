@@ -5,6 +5,7 @@ Steps (each is a subcommand so Claude Code can run them one by one):
 
   fetch       URL            download the source with yt-dlp            -> work/<slug>/source.mp4
   transcribe  <slug>         word-level transcript with faster-whisper  -> transcript.json / transcript.txt
+  peaks       <slug>         loudest "hype" moments (screams, laughs)   -> peaks.txt
   render      <slug>         cut + 9:16 crop + burned captions          -> out/<slug>/clip_NN.mp4
 
 Between `transcribe` and `render`, someone (Claude Code, reading transcript.txt) writes
@@ -57,10 +58,10 @@ def cmd_fetch(args: argparse.Namespace) -> None:
         slug = args.slug or slugify(out)
         d = WORK / slug
         d.mkdir(parents=True, exist_ok=True)
-        run([
-            "yt-dlp", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
-            "--merge-output-format", "mp4", "-o", str(d / "source.%(ext)s"), args.url,
-        ])
+        cmd = ["yt-dlp", "-f", "bv*[height<=1080]+ba/b[height<=1080]/b", "--merge-output-format", "mp4"]
+        if args.section:  # e.g. 1:20:00-1:50:00 — grab only part of a 10-hour stream VOD
+            cmd += ["--download-sections", f"*{args.section}", "--force-keyframes-at-cuts"]
+        run(cmd + ["-o", str(d / "source.%(ext)s"), args.url])
     print(f"slug: {slug}")
 
 
@@ -88,6 +89,49 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
     (d / "transcript.txt").write_text("\n".join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in segs))
     print(f"wrote {d/'transcript.txt'} ({len(segs)} segments, language={info.language})")
 
+
+
+# ---------------------------------------------------------------- peaks
+def cmd_peaks(args: argparse.Namespace) -> None:
+    """Find hype moments: seconds whose loudness jumps well above the stream's normal level.
+
+    Gaming/stream clips often peak on a reaction (scream, laugh, rage) that a transcript alone misses.
+    """
+    import statistics
+
+    d = WORK / args.slug
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(d / "source.mp4"), "-vn",
+         "-af", "aresample=16000,asetnsamples=16000,astats=metadata=1:reset=1,"
+                "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+         "-f", "null", "-"],
+        check=True, capture_output=True, text=True,
+    )
+    levels, t = [], None
+    for line in res.stdout.splitlines():
+        if "pts_time:" in line:
+            t = float(line.rsplit("pts_time:", 1)[1])
+        elif "RMS_level=" in line and t is not None:
+            v = line.split("=", 1)[1]
+            levels.append((t, -120.0 if v in ("-inf", "inf", "nan") else float(v)))
+    if not levels:
+        sys.exit("no audio found")
+    vals = [v for _, v in levels]
+    med = statistics.median(vals)
+    spread = statistics.pstdev(vals) or 1.0
+    # score each second against the median; keep the strongest, at least `gap` seconds apart
+    scored = sorted(((v - med) / spread, t, v) for t, v in levels)[::-1]
+    picked: list[tuple[float, float, float]] = []
+    for z, t, v in scored:
+        if z < args.min_z or len(picked) >= args.top:
+            break
+        if all(abs(t - pt) >= args.gap for _, pt, _ in picked):
+            picked.append((z, t, v))
+    picked.sort(key=lambda x: x[1])
+    lines = [f"# median RMS {med:.1f} dB, stdev {spread:.1f} dB. Suggested window: peak-20s .. peak+10s"]
+    lines += [f"{fmt(t)}  t={t:.0f}s  {v:.1f} dB  (+{z:.1f} sd)" for z, t, v in picked]
+    (d / "peaks.txt").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
 
 # ---------------------------------------------------------------- render
 def ass_time(t: float) -> str:
@@ -144,6 +188,13 @@ def cmd_render(args: argparse.Namespace) -> None:
     # 16:9 -> 9:16: centre crop (fill) — or "blur" pads the full frame over a blurred background.
     if args.layout == "crop":
         vf_base = "crop=ih*9/16:ih,scale=1080:1920"
+    elif args.layout == "stack":
+        # Streamer layout: facecam box (--cam x:y:w:h in source pixels) on top, gameplay below.
+        if not args.cam:
+            sys.exit("--layout stack needs --cam x:y:w:h (the facecam rectangle in the source video)")
+        cx, cy, cw, ch = args.cam.split(":")
+        vf_base = (f"split[a][b];[a]crop={cw}:{ch}:{cx}:{cy},scale=1080:640:force_original_aspect_ratio=increase,"
+                   f"crop=1080:640[cam];[b]crop=ih*27/32:ih,scale=1080:1280[game];[cam][game]vstack")
     else:
         vf_base = ("split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20[bg];"
                    "[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
@@ -165,10 +216,16 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch"); f.add_argument("url"); f.add_argument("--slug")
+    f.add_argument("--section", help="only download this time range, e.g. 1:20:00-1:50:00")
     t = sub.add_parser("transcribe"); t.add_argument("slug"); t.add_argument("--model", default="small")
-    r = sub.add_parser("render"); r.add_argument("slug"); r.add_argument("--layout", choices=["crop", "blur"], default="blur")
+    k = sub.add_parser("peaks"); k.add_argument("slug"); k.add_argument("--top", type=int, default=15)
+    k.add_argument("--gap", type=float, default=30, help="min seconds between peaks")
+    k.add_argument("--min-z", type=float, default=2.0, help="min loudness above normal, in std devs")
+    r = sub.add_parser("render"); r.add_argument("slug")
+    r.add_argument("--layout", choices=["crop", "blur", "stack"], default="blur")
+    r.add_argument("--cam", help="facecam rectangle x:y:w:h for --layout stack")
     a = p.parse_args()
-    {"fetch": cmd_fetch, "transcribe": cmd_transcribe, "render": cmd_render}[a.cmd](a)
+    {"fetch": cmd_fetch, "transcribe": cmd_transcribe, "peaks": cmd_peaks, "render": cmd_render}[a.cmd](a)
 
 
 if __name__ == "__main__":
